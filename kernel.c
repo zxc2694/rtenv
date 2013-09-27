@@ -5,49 +5,11 @@
 
 #include <stddef.h>
 
-void *memcpy(void *dest, const void *src, size_t n);
+#include "utils.h"
 
-int strcmp(const char *a, const char *b) __attribute__ ((naked));
-int strcmp(const char *a, const char *b)
-{
-	asm(
-        "strcmp_lop:                \n"
-        "   ldrb    r2, [r0],#1     \n"
-        "   ldrb    r3, [r1],#1     \n"
-        "   cmp     r2, #1          \n"
-        "   it      hi              \n"
-        "   cmphi   r2, r3          \n"
-        "   beq     strcmp_lop      \n"
-		"	sub     r0, r2, r3  	\n"
-        "   bx      lr              \n"
-		:::
-	);
-}
+#define NEWLINE "\n\r"
 
-size_t strlen(const char *s) __attribute__ ((naked));
-size_t strlen(const char *s)
-{
-	asm(
-		"	sub  r3, r0, #1			\n"
-        "strlen_loop:               \n"
-		"	ldrb r2, [r3, #1]!		\n"
-		"	cmp  r2, #0				\n"
-        "   bne  strlen_loop        \n"
-		"	sub  r0, r3, r0			\n"
-		"	bx   lr					\n"
-		:::
-	);
-}
 
-void puts(char *s)
-{
-	while (*s) {
-		while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET)
-			/* wait */ ;
-		USART_SendData(USART2, *s);
-		s++;
-	}
-}
 
 #define STACK_SIZE 512 /* Size of task stacks in words */
 #define TASK_LIMIT 8  /* Max number of tasks we can handle */
@@ -104,6 +66,10 @@ struct task_control_block {
     struct task_control_block **prev;
     struct task_control_block  *next;
 };
+
+// Global task variables
+struct task_control_block tasks[TASK_LIMIT];
+size_t task_count = 0;
 
 /* 
  * pathserver assumes that all files are FIFOs that were registered
@@ -314,7 +280,75 @@ void queue_str_task2()
 	queue_str_task("Hello 2\n", 50);
 }
 
-void serial_readwrite_task()
+char *get_task_status(int status)
+{
+	switch(status) {
+		case TASK_READY:
+			return "Ready";
+		case TASK_WAIT_READ:
+			return "Wait Read";
+		case TASK_WAIT_WRITE:
+			return "Wait Write";
+		case TASK_WAIT_INTR:
+			return "Wait Intr";
+		case TASK_WAIT_TIME:
+			return "Wait Time";
+		default:
+			return "Unknown status";
+	}
+}
+
+void proc_cmd(char *cmd)
+{
+	char tmp[16];
+	int i;
+
+	if(!strcmp(cmd, "ps")) {
+	    	puts("Task list : " NEWLINE "\0");
+	    	for(i = 0; i < task_count; i++) {
+	    	    	puts("PID -> ");
+	    	    	int2str(tasks[i].pid, tmp);
+			puts(tmp);
+
+			puts(", Status -> ");
+			puts(get_task_status(tasks[i].status));
+
+			puts(", Priority -> ");
+			int2str(tasks[i].priority, tmp);
+			puts(tmp);
+
+			puts(NEWLINE "\0");
+		}
+	}
+	else if(!strncmp(cmd, "echo", 4) && (strlen(cmd) == 4) || cmd[4] == ' ') {
+		if(strlen(cmd) == 4) {
+			puts(" \0");
+		}
+		else {
+			for(i = 5; i < strlen(cmd); i++) {
+				tmp[0] = cmd[i];
+				tmp[1] = '\0';
+				puts(tmp);
+			}
+		}
+	}
+	else if(!strcmp(cmd, "hello")) {
+		puts("Hello! nice to meet you ^_^" NEWLINE "\0");
+	}
+	else if(!strcmp(cmd, "help")) {
+		puts("You can use 4 command in zxc2694's shell." NEWLINE "\0");
+		puts(" "NEWLINE "\0");
+		puts("ps    - List all tasks" NEWLINE "\0");
+		puts("echo  - Output message" NEWLINE "\0");
+		puts("hello - Show welcome message" NEWLINE "\0");
+		puts("help  - Show this help table" NEWLINE "\0");
+	}
+	else {
+	    puts("Command not found" NEWLINE "\0");
+	}
+}
+
+void MYserial_readwrite_task()
 {
 	int fdout, fdin;
 	char str[100];
@@ -325,11 +359,14 @@ void serial_readwrite_task()
 	fdout = mq_open("/tmp/mqueue/out", 0);
 	fdin = open("/dev/tty0/in", 0);
 
-	/* Prepare the response message to be queued. */
-	memcpy(str, "Got:", 4);
+	// Prepare prompt hint string
+	char *prompt_hint = "zxc2694_shell $ \0";
 
 	while (1) {
-		curr_char = 4;
+	    	// Prompt hint
+		puts(prompt_hint);
+
+		curr_char = 0;
 		done = 0;
 		do {
 			/* Receive a byte from the RS232 port (this call will
@@ -340,21 +377,59 @@ void serial_readwrite_task()
 			 * finish the string and inidcate we are done.
 			 */
 			if (curr_char >= 98 || (ch == '\r') || (ch == '\n')) {
-				str[curr_char] = '\n';
-				str[curr_char+1] = '\0';
+				str[curr_char++] = '\0';
 				done = -1;
 				/* Otherwise, add the character to the
 				 * response string. */
 			}
+			else if(ch == 27) {
+				read(fdin, &ch, 1);
+				read(fdin, &ch, 1);
+				char tmpesc[4];
+				tmpesc[0] = 27;
+				tmpesc[3] = '\0';
+				switch(ch) {
+					case 65: // Up key
+					case 66: // Down key
+						break;
+					case 67: // Right key
+						tmpesc[1] = '[';
+						tmpesc[2] = 'C';
+						puts(tmpesc);
+						curr_char++;
+						break;
+					case 68: // Left key
+						if(curr_char > 0) {
+							tmpesc[1] = '[';
+							tmpesc[2] = 'D';
+							puts(tmpesc);
+							curr_char--;
+						}
+						break;
+				}
+			}
+			else if(ch == 127) {
+				if(curr_char > 0) {
+					puts("\b \b\0");
+					curr_char--;
+				}
+			}
 			else {
 				str[curr_char++] = ch;
+				char tmpstr[2];
+				tmpstr[0] = ch;
+				tmpstr[1] = '\0';
+				puts(tmpstr);
 			}
+			// Output thr current input character
 		} while (!done);
 
 		/* Once we are done building the response string, queue the
 		 * response to be sent to the RS232 port.
 		 */
-		write(fdout, str, curr_char+1+1);
+	    	puts(NEWLINE "\0");
+		proc_cmd(str);
+		puts(NEWLINE "\0");
 	}
 }
 
@@ -366,9 +441,7 @@ void first()
 	if (!fork()) setpriority(0, 0), serialout(USART2, USART2_IRQn);
 	if (!fork()) setpriority(0, 0), serialin(USART2, USART2_IRQn);
 	if (!fork()) rs232_xmit_msg_task();
-	if (!fork()) setpriority(0, PRIORITY_DEFAULT - 10), queue_str_task1();
-	if (!fork()) setpriority(0, PRIORITY_DEFAULT - 10), queue_str_task2();
-	if (!fork()) setpriority(0, PRIORITY_DEFAULT - 10), serial_readwrite_task();
+	if (!fork()) setpriority(0, PRIORITY_DEFAULT - 10), MYserial_readwrite_task();
 
 	setpriority(0, PRIORITY_LIMIT);
 
@@ -669,11 +742,11 @@ _mknod(struct pipe_ringbuffer *pipe, int dev)
 int main()
 {
 	unsigned int stacks[TASK_LIMIT][STACK_SIZE];
-	struct task_control_block tasks[TASK_LIMIT];
+	//struct task_control_block tasks[TASK_LIMIT];
 	struct pipe_ringbuffer pipes[PIPE_LIMIT];
 	struct task_control_block *ready_list[PRIORITY_LIMIT + 1];  /* [0 ... 39] */
 	struct task_control_block *wait_list = NULL;
-	size_t task_count = 0;
+	//size_t task_count = 0;
 	size_t current_task = 0;
 	size_t i;
 	struct task_control_block *task;
